@@ -31,11 +31,11 @@ const CATEGORIES = [
 const COV_ITEM = {
   type: "object",
   properties: {
-    name:     { type: "string",  description: "담보명 원문(순번·고지구분 접두어 제거)" },
-    category: { type: "string",  enum: CATEGORIES, description: "표준 카테고리. 명칭이 달라도 의미가 가장 가까운 항목으로 매핑, 없으면 '기타'" },
-    amt:      { type: "integer", description: "가입금액(만원 단위 정수)" }
+    name:   { type: "string",  description: "담보명 원문(순번·고지구분 접두어 제거)" },
+    catIdx: { type: "integer", description: "표준 카테고리 번호(프롬프트의 번호표 참조). 해당 없으면 40(기타)" },
+    amt:    { type: "integer", description: "가입금액(만원 단위 정수)" }
   },
-  required: ["name", "category", "amt"]
+  required: ["name", "catIdx", "amt"]
 };
 
 const REPORT_SCHEMA = {
@@ -74,7 +74,9 @@ const PROPOSAL_SCHEMA = {
 };
 
 const MAPPING_RULES = `
-[표준 카테고리 매핑 규칙 — 보험사마다 명칭이 달라도 의미로 매핑]
+[표준 카테고리 번호표 — catIdx 는 반드시 아래 번호로]
+${CATEGORIES.map((c, i) => `${i}=${c}`).join(', ')}
+[매핑 규칙 — 보험사마다 명칭이 달라도 의미로 매핑]
 - '유사암'에는 제자리암·경계성종양·갑상선암·기타피부암·소액암이 포함됨 → 유사암진단비
 - '뇌혈관질환'은 뇌졸중·뇌출혈을 포괄하는 상위 개념. '뇌졸중'은 뇌졸중진단비, '뇌출혈'은 뇌출혈진단비로 각각 구분
 - '허혈성심장질환'은 급성심근경색을 포괄. '급성심근경색'만 명시되면 급성심근경색진단비
@@ -115,23 +117,39 @@ const json = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
 
 async function callGemini(model, body) {
-  return fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    { method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
-      body: JSON.stringify(body) }
-  );
+  // Netlify 10초 강제 종료 전에 자체 9초 컷 → 클라이언트가 명확한 타임아웃 JSON을 받도록
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 9000);
+  try {
+    return await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      { method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
+        body: JSON.stringify(body), signal: ac.signal }
+    );
+  } finally { clearTimeout(timer); }
 }
 
 // 모델 체인을 순회: 모델 미존재(404)/지원불가(400 모델 관련)면 다음 모델로
+// thinkingConfig 미지원 모델이면 해당 옵션만 빼고 같은 모델로 1회 재시도
 async function callWithFallback(body) {
   let lastErr = null;
   for (const model of MODEL_CHAIN) {
-    const r = await callGemini(model, body);
-    if (r.ok) return { r, model };
-    const t = await r.text();
-    lastErr = { status: r.status, detail: t.slice(0, 400), model };
-    if (r.status !== 404 && !(r.status === 400 && /model/i.test(t))) break; // 모델 문제가 아니면 중단
+    let r = await callGemini(model, body);
+    if (!r.ok) {
+      let t = await r.text();
+      if (r.status === 400 && /thinking/i.test(t) && body.generationConfig?.thinkingConfig) {
+        const b2 = JSON.parse(JSON.stringify(body));
+        delete b2.generationConfig.thinkingConfig;
+        r = await callGemini(model, b2);
+        if (r.ok) return { r, model };
+        t = await r.text();
+      }
+      lastErr = { status: r.status, detail: t.slice(0, 400), model };
+      if (r.status !== 404 && !(r.status === 400 && /model/i.test(t))) break; // 모델 문제가 아니면 중단
+      continue;
+    }
+    return { r, model };
   }
   return { err: lastErr };
 }
@@ -168,7 +186,8 @@ export default async (req) => {
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: isReport ? REPORT_SCHEMA : PROPOSAL_SCHEMA,
-      temperature: 0
+      temperature: 0,
+      thinkingConfig: { thinkingBudget: 0 }   // 추론 과정 생략 → 응답 속도 대폭 단축
     }
   };
 
@@ -178,9 +197,16 @@ export default async (req) => {
     const data = await r.json();
     const text = (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("") || "{}";
     const clean = text.replace(/```json|```/g, "").trim();
-    try { JSON.parse(clean); } catch { return json({ error: "AI 응답 파싱 실패", raw: clean.slice(0, 300) }, 502); }
-    return new Response(clean, { headers: { "Content-Type": "application/json" } });
+    let obj;
+    try { obj = JSON.parse(clean); } catch { return json({ error: "AI 응답 파싱 실패", raw: clean.slice(0, 300) }, 502); }
+    // catIdx(번호) → 표준 카테고리명 변환 (프런트는 기존처럼 category 문자열 수신)
+    const fix = covs => (covs || []).map(v => ({ name: v.name, category: CATEGORIES[v.catIdx] ?? "기타", amt: v.amt }));
+    if (isReport && Array.isArray(obj.contracts)) obj.contracts.forEach(c => { c.covs = fix(c.covs); });
+    if (!isReport) obj.covs = fix(obj.covs);
+    return json(obj);
   } catch (e) {
+    if (e.name === "AbortError" || /abort/i.test(String(e)))
+      return json({ error: "분석 시간 초과 — 페이지 구간이 너무 큽니다 (자동으로 더 작게 나눠 재시도됩니다)" }, 504);
     return json({ error: String(e) }, 500);
   }
 };
