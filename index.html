@@ -6,6 +6,7 @@
 <title>보장분석 리포트메이커 v2 — ROYAL</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/gh/gitbrent/pptxgenjs@3.12.0/dist/pptxgen.bundle.js"></script>
 <style>
 /* ===== INCAR 디자인 시스템 ===== */
@@ -167,6 +168,7 @@ table.pv tr.sum td{background:var(--c-teal-bg-3);font-weight:800;}
   <input type="file" id="fileReport" accept="application/pdf" class="hide">
   <div class="prog" id="progReport"><div class="bar"><div class="fill"></div></div><div class="txt"></div></div>
   <button class="btn ghost sm" id="btnRetryChunks" style="display:none;margin-top:10px;" onclick="retryChunks()">⟳ 실패 구간만 다시 분석</button>
+  <button class="btn ghost sm" id="btnFullScan" style="display:none;margin-top:10px;margin-left:6px;" onclick="fullScan()">🔍 누락이 있나요? 전체 페이지로 재분석</button>
   <div class="inrow" style="margin-top:16px;">
     <div><label>고객명</label><input type="text" id="custName" placeholder="예: 황지훈" style="width:160px;"></div>
     <div><label>설계사명</label><input type="text" id="plannerName" placeholder="예: 전성재" style="width:160px;"></div>
@@ -316,21 +318,29 @@ function prog(id, ratio, txt){
 /* ================= PDF 분할 + AI 호출 ================= */
 async function fileToBytes(f){ return new Uint8Array(await f.arrayBuffer()); }
 
-async function splitPdf(bytes, chunkPages){
-  const src = await PDFLib.PDFDocument.load(bytes, {ignoreEncryption:true});
-  const total = src.getPageCount();
-  const chunks = [];
-  for(let i=0;i<total;i+=chunkPages){
-    const d = await PDFLib.PDFDocument.create();
-    const idx = Array.from({length: Math.min(chunkPages, total-i)}, (_,k)=>i+k);
-    (await d.copyPages(src, idx)).forEach(p=>d.addPage(p));
-    chunks.push(await d.saveAsBase64());
-  }
-  return chunks;
+// 텍스트 레이어를 스캔해 계약 상세(별첨) 페이지만 골라냄 → AI 호출량 대폭 절감
+// 마커: 계약 페이지마다 존재하는 "(정상계약 리스트)" / "납입주기/기간" / "보장기간 YYYY." 패턴
+// 한글 추출을 위해 cMap 필수. 텍스트 레이어가 깨진 PDF면 빈 배열 반환 → 전체 페이지로 폴백
+const ANNEX_RX = /정상계약\s*리스트|납입주기\s*\/\s*기간|보장기간\s*[0-9]{4}\./;
+async function detectAnnexPages(bytes){
+  try{
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+    const doc = await pdfjsLib.getDocument({data: bytes,
+      cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/cmaps/', cMapPacked: true}).promise;
+    const annex = [];
+    for(let p=1; p<=doc.numPages; p++){
+      const tc = await (await doc.getPage(p)).getTextContent();
+      const txt = tc.items.map(i=>i.str).join('');
+      if(ANNEX_RX.test(txt)) annex.push(p-1);
+    }
+    return annex;
+  }catch(e){ return []; }
 }
 
 const sleep = ms => new Promise(s=>setTimeout(s,ms));
 const isRateMsg = m => /429|RESOURCE_EXHAUSTED|quota|rate/i.test(m||'');
+
+const isTimeoutMsg = m => /TIMEOUT::|timed?\s*out|시간 초과/i.test(m||'');
 
 async function callAI(mode, pdfBase64, tries=4){
   let delay = 2500;
@@ -342,20 +352,27 @@ async function callAI(mode, pdfBase64, tries=4){
       const txt = await r.text();
       let j;
       try{ j = JSON.parse(txt); }
-      catch{ throw new Error(`서버 함수 응답 오류 (HTTP ${r.status}) — 함수가 배포되지 않았을 수 있습니다. Netlify Drop(드래그 배포)은 함수를 지원하지 않으므로 Git 또는 CLI로 배포해야 합니다.`); }
-      if(!r.ok || j.error){
-        const msg = (j.error||('HTTP '+r.status)) + (j.detail ? ' · ' + String(j.detail).slice(0,150) : '');
+      catch{
+        if(r.status===504) throw new Error('TIMEOUT::분석 시간 초과 (서버 함수 10초 제한, HTTP 504)');
+        if(r.status===404) throw new Error('서버 함수가 응답하지 않습니다 (HTTP 404) — 함수 미배포 가능성. Netlify Drop은 함수를 지원하지 않으므로 Git/CLI로 배포하세요.');
+        throw new Error(`서버 응답 오류 (HTTP ${r.status})`);
+      }
+      if(!r.ok || j.error || j.errorMessage){
+        const raw = j.error || j.errorMessage || ('HTTP '+r.status);
+        const msg = raw + (j.detail ? ' · ' + String(j.detail).slice(0,150) : '');
+        if(r.status===504 || /timed?\s*out/i.test(raw)) throw new Error('TIMEOUT::분석 시간 초과 (서버 함수 10초 제한)');
         if(isRateMsg(msg)) throw new Error('RATE::' + msg);   // 사용량 제한 → 백오프 재시도 대상
         throw new Error(msg);
       }
       return j;
     }catch(e){
       lastErr = e;
+      if(String(e.message).startsWith('TIMEOUT::')) break;   // 타임아웃은 재시도 무의미 → 호출부에서 구간을 쪼개 처리
       const rate = String(e.message).startsWith('RATE::');
       if(a < tries-1){ await sleep(rate ? delay : 1500); delay *= 2; continue; }
     }
   }
-  throw new Error(String(lastErr.message).replace('RATE::','API 사용량 제한 — '));
+  throw new Error(String(lastErr.message).replace('RATE::','API 사용량 제한 — ').replace('TIMEOUT::',''));
 }
 
 async function pool(tasks, limit, onDone){
@@ -378,13 +395,13 @@ function sanitizeCov(v){
            amt: Math.max(0, parseInt(v.amt)||0) };
 }
 
-/* ----- 보장분석 리포트 처리 (구간 단위 복구 지원) ----- */
-let RC = { chunks: [], failed: [] };   // 분할된 PDF 구간을 메모리에 보관 → 실패 구간만 재분석 가능
+/* ----- 보장분석 리포트 처리 (페이지 그룹 기반 · 타임아웃 자동 분할 · 구간 복구) ----- */
+let RC = { bytes:null, srcDoc:null, groups:[], failed:[], expected:0, filtered:false };
 
 const ckey = c => (c.insurer||'')+'|'+(c.productName||'')+'|'+(c.monthlyPremium||'');
 
 function absorbReport(pairs){
-  // pairs: [{ci: 구간번호, data: AI응답}] → 기존 report 계약과 중복 없이 흡수
+  // pairs: [{ci: 첫 페이지 번호(정렬용), data: AI응답}] → 기존 report 계약과 중복 없이 흡수
   const seen = new Set(S.contracts.filter(c=>c.src==='report').map(ckey));
   pairs.forEach(({ci, data})=>{
     (data.contracts||[]).forEach((c, oi)=>{
@@ -400,54 +417,114 @@ function absorbReport(pairs){
   S.contracts = rep.concat(S.contracts.filter(c=>c.src!=='report'));
 }
 
-async function runReportChunks(idxList, limit){
-  $('#btnRetryChunks').style.display = 'none';
-  const tasks = idxList.map(i => () => callAI('report', RC.chunks[i]));
-  const results = await pool(tasks, limit, (d,t)=> prog('#progReport', 0.08 + 0.88*d/t, `AI 분석 중... (${d}/${t} 구간)`));
+async function buildChunk(pages){
+  if(!RC.srcDoc) RC.srcDoc = await PDFLib.PDFDocument.load(RC.bytes, {ignoreEncryption:true});
+  const d = await PDFLib.PDFDocument.create();
+  (await d.copyPages(RC.srcDoc, pages)).forEach(p=>d.addPage(p));
+  return d.saveAsBase64();
+}
 
-  const okPairs = [], failed = [];
-  let lastErrMsg = '';
-  results.forEach((r,k)=>{
-    const ci = idxList[k];
-    if(r.ok && Array.isArray(r.data.contracts)) okPairs.push({ci, data:r.data});
-    else { failed.push(ci); lastErrMsg = r.err ? r.err.message : 'AI 응답 형식 오류'; }
+// 페이지 그룹 1개 분석. 타임아웃이면 그룹을 반으로 쪼개 재귀 시도 (최대 2단계 → 1페이지까지)
+// 반환: 최종 실패한 {pages, err} 목록 (성공 시 빈 배열)
+async function analyzeGroup(pages, depth=0){
+  try{
+    const b64 = await buildChunk(pages);
+    const data = await callAI('report', b64);
+    if(Array.isArray(data.contracts) && data.contracts.length){
+      absorbReport([{ci: pages[0], data}]); refreshAll();
+    }
+    return [];
+  }catch(e){
+    if(isTimeoutMsg(e.message) && pages.length > 1 && depth < 2){
+      const mid = Math.ceil(pages.length/2);
+      const f1 = await analyzeGroup(pages.slice(0, mid), depth+1);
+      const f2 = await analyzeGroup(pages.slice(mid), depth+1);
+      return f1.concat(f2);
+    }
+    return [{pages, err: e}];
+  }
+}
+
+async function runReportGroups(groups, limit){
+  $('#btnRetryChunks').style.display = 'none';
+  const tasks = groups.map(g => () => analyzeGroup(g, 0));
+  const results = await pool(tasks, limit, (d,t)=>{
+    const n = S.contracts.filter(c=>c.src==='report').length;
+    prog('#progReport', 0.12 + 0.84*d/t, `AI 분석 중... ${d}/${t} 구간 완료 · 계약 ${n}건 확보`);
   });
-  absorbReport(okPairs);
+
+  const failed = []; let lastErrMsg = '';
+  results.forEach(r=>{
+    const fl = r.ok ? r.data : [{pages: [], err: r.err}];
+    fl.forEach(f=>{ if(f.pages.length) failed.push(f.pages); lastErrMsg = f.err ? f.err.message : ''; });
+  });
   RC.failed = failed;
 
   const reps = S.contracts.filter(c=>c.src==='report');
   const nCov = reps.reduce((s,c)=>s+c.covs.length,0);
+  const expTxt = RC.expected ? ` (계약 페이지 ${RC.expected}장 감지)` : '';
   if(failed.length){
-    prog('#progReport', 1, `⚠ 현재 계약 ${reps.length}건 추출 — 구간 ${failed.length}개 분석 실패 (${lastErrMsg.slice(0,90)})`);
+    const failPages = failed.flat().map(p=>p+1).join(', ');
+    prog('#progReport', 1, `⚠ 현재 계약 ${reps.length}건 추출${expTxt} — ${failed.length}개 구간(p.${failPages}) 실패: ${lastErrMsg.slice(0,80)}`);
     $('#btnRetryChunks').style.display = 'inline-flex';
     $('#btnRetryChunks').textContent = `⟳ 실패한 ${failed.length}개 구간만 다시 분석 (PDF 재업로드 불필요)`;
   } else if(!reps.length){
-    prog('#progReport', 1, '계약을 찾지 못했습니다. [별첨] 보험서비스(상품)별 보장 현황 페이지가 포함된 보장분석 리포트인지 확인해주세요.');
+    prog('#progReport', 1, '계약을 찾지 못했습니다. 계약 상세(별첨) 페이지가 포함된 보장분석 리포트인지 확인해주세요.');
+    if(RC.filtered) $('#btnFullScan').style.display = 'inline-flex';
   } else {
-    prog('#progReport', 1, `✓ 완료 — 계약 ${reps.length}건, 담보 ${nCov}개 추출. 리포트 표지의 보유계약 건수와 일치하는지 확인해주세요.`);
+    prog('#progReport', 1, `✓ 완료 — 계약 ${reps.length}건, 담보 ${nCov}개 추출${expTxt}`);
+    if(RC.filtered && RC.expected && reps.length < RC.expected) $('#btnFullScan').style.display = 'inline-flex';
   }
   refreshAll(); persist();
 }
 
 async function retryChunks(){
   if(!RC.failed.length) return;
-  if(!RC.chunks.length){ alert('PDF 데이터가 메모리에 없습니다. 페이지를 새로고침한 경우 PDF를 다시 업로드해주세요.'); return; }
-  prog('#progReport', 0.08, `실패 구간 ${RC.failed.length}개 재분석 중... (사용량 제한 회피를 위해 순차 처리)`);
-  await runReportChunks(RC.failed, 1);   // 순차 1개씩 — 무료 등급 한도 회피
+  if(!RC.bytes){ alert('PDF 데이터가 메모리에 없습니다. 페이지를 새로고침한 경우 PDF를 다시 업로드해주세요.'); return; }
+  prog('#progReport', 0.12, `실패 구간 ${RC.failed.length}개 재분석 중... (순차 처리)`);
+  await runReportGroups(RC.failed, 1);   // 순차 1개씩 — 사용량 제한·타임아웃 회피
+}
+
+const chunkArr = (arr, n) => Array.from({length: Math.ceil(arr.length/n)}, (_,i)=>arr.slice(i*n, i*n+n));
+
+async function analyzeReport(bytes, useFilter){
+  $('#btnFullScan').style.display = 'none';
+  let pageIdx = null;
+  if(useFilter){
+    prog('#progReport', 0.04, '계약 상세 페이지 스캔 중...');
+    const annex = await detectAnnexPages(bytes.slice());
+    if(annex.length){ pageIdx = annex; RC.expected = annex.length; RC.filtered = true; }
+    else { RC.expected = 0; RC.filtered = false; }
+  } else { RC.expected = 0; RC.filtered = false; }
+
+  if(!pageIdx){
+    if(!RC.srcDoc) RC.srcDoc = await PDFLib.PDFDocument.load(bytes, {ignoreEncryption:true});
+    pageIdx = Array.from({length: RC.srcDoc.getPageCount()}, (_,i)=>i);
+  }
+  prog('#progReport', 0.08, RC.filtered
+    ? `계약 페이지 ${pageIdx.length}장만 추려서 분석합니다 (불필요한 페이지 제외 → 속도 향상)`
+    : `전체 ${pageIdx.length}페이지 분석을 시작합니다`);
+  RC.groups = chunkArr(pageIdx, 3);   // 3페이지/구간 — 함수 10초 제한 내 안전 마진
+  RC.failed = [];
+  S.contracts = S.contracts.filter(c=>c.src!=='report');   // 재업로드 대응 (제안/수동은 유지)
+  prog('#progReport', 0.12, `${RC.groups.length}개 구간 · AI 분석 시작`);
+  await runReportGroups(RC.groups, 2);
 }
 
 async function handleReport(file){
   if(file.size > 30*1024*1024){ alert('30MB 이하 PDF만 지원합니다.'); return; }
   try{
-    prog('#progReport', 0.03, 'PDF 페이지 분할 중...');
     const bytes = await fileToBytes(file);
-    RC = { chunks: await splitPdf(bytes, 4), failed: [] };
-    S.contracts = S.contracts.filter(c=>c.src!=='report');   // 재업로드 대응 (제안/수동은 유지)
-    prog('#progReport', 0.08, `${RC.chunks.length}개 구간으로 분할 완료 · AI 분석 시작`);
-    await runReportChunks(RC.chunks.map((_,i)=>i), 2);
+    RC = { bytes, srcDoc:null, groups:[], failed:[], expected:0, filtered:false };
+    await analyzeReport(bytes, true);
   }catch(e){
     prog('#progReport', 1, '오류: ' + e.message);
   }
+}
+
+async function fullScan(){
+  if(!RC.bytes){ alert('PDF를 다시 업로드해주세요.'); return; }
+  await analyzeReport(RC.bytes, false);
 }
 
 /* ----- 제안서 처리 ----- */
