@@ -50,6 +50,7 @@ const REPORT_SCHEMA = {
           productName:    { type: "string",  description: "보험서비스(상품)명" },
           monthlyPremium: { type: "integer", description: "보험료(원). 페이지 상단 헤더의 숫자" },
           payProgress:    { type: "string",  description: "납입횟수 (예: 41/240)" },
+          payTerm:        { type: "string",  description: "납입주기/기간 (예: 월납/20년)" },
           period:         { type: "string",  description: "보장기간 (예: 2023.01.10~2043.01.10)" },
           covs:           { type: "array", items: COV_ITEM }
         },
